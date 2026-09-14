@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import fcntl
 import json
 import os
 import shutil
@@ -36,6 +37,33 @@ _REQUIRED_ARTIFACTS = [
     os.path.join("spyreCodeDir", "init_binary.bin"),
     os.path.join("spyreCodeDir", "spyrecode.json"),
 ]
+
+# Sentinel written after a cache entry is fully committed. On NFS a directory
+# rename may become visible to other clients before all files inside it are
+# readable, so a cache hit is only accepted once this sentinel exists.
+_READY_SENTINEL = "ready"
+
+
+def _acquire_cache_lock(cache_root: str) -> int:
+    """Acquire an advisory lock on a file in the cache root.
+
+    Returns the file descriptor; the caller must close it after the locked
+    section. NFS supports flock when mounted with local_lock=none (the default
+    on the CI PVC), so this serializes commits across pods.
+    """
+    lock_path = os.path.join(cache_root, ".commit.lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _release_cache_lock(fd: int) -> None:
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +446,13 @@ def get_cached_kernel_dir(cache_key: str) -> Optional[str]:
         logger.info("Cache MISS: No cached kernel found for key %s", cache_key)
         return None
 
+    if not os.path.isfile(os.path.join(cached_dir, _READY_SENTINEL)):
+        logger.info(
+            "Cache MISS: Cached dir exists but ready sentinel is missing for key %s",
+            cache_key,
+        )
+        return None
+
     missing = [
         p
         for p in _REQUIRED_ARTIFACTS
@@ -464,24 +499,69 @@ def commit_compile_dir(tmp_dir: str, cache_key: str) -> str:
 
     If another process already committed the same key, discards the temp dir
     and reuses the existing entry. Returns the final cache dir.
+
+    On shared/NFS storage a directory rename can become visible to other
+    clients before the files inside it are readable. We serialize commits with
+    an advisory flock and write a sentinel file after the rename so readers
+    only treat the entry as ready once all artifacts are visible.
     """
     cache_root = get_cache_root_dir()
     cached_dir = os.path.join(cache_root, cache_key)
 
-    if os.path.isdir(cached_dir):
-        # Another process/thread won the race — discard our copy.
+    if os.path.isdir(cached_dir) and os.path.isfile(
+        os.path.join(cached_dir, _READY_SENTINEL)
+    ):
+        # Another process/thread won the race and fully committed.
         shutil.rmtree(tmp_dir, ignore_errors=True)
         logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
         return cached_dir
 
+    lock_fd = _acquire_cache_lock(cache_root)
     try:
-        os.rename(tmp_dir, cached_dir)  # Atomic on POSIX (same filesystem)
-        logger.info("Saved compiled kernel to cache: %s", cached_dir)
-    except OSError:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
+        # Re-check under the lock.
+        if os.path.isdir(cached_dir) and os.path.isfile(
+            os.path.join(cached_dir, _READY_SENTINEL)
+        ):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            logger.info(
+                "Cache race resolved under lock: reusing existing entry at %s",
+                cached_dir,
+            )
+            return cached_dir
 
-    return cached_dir
+        if os.path.isdir(cached_dir):
+            # A partially-committed entry (directory exists but no sentinel).
+            # It is unsafe to use; remove it and replace with our complete copy.
+            shutil.rmtree(cached_dir, ignore_errors=True)
+
+        try:
+            os.rename(tmp_dir, cached_dir)
+        except OSError:
+            # Another client may have created the directory between re-check
+            # and rename; treat it as a race loss and clean up.
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            if os.path.isdir(cached_dir) and not os.path.isfile(
+                os.path.join(cached_dir, _READY_SENTINEL)
+            ):
+                shutil.rmtree(cached_dir, ignore_errors=True)
+            logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
+            return cached_dir
+
+        # Write the ready sentinel only after the directory and all its
+        # contents are in place.
+        sentinel_path = os.path.join(cached_dir, _READY_SENTINEL)
+        with open(sentinel_path, "w") as f:
+            f.write("")
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+
+        logger.info("Saved compiled kernel to cache: %s", cached_dir)
+        return cached_dir
+    finally:
+        _release_cache_lock(lock_fd)
 
 
 def _move_to_failed_dir(compile_dir: str) -> None:
