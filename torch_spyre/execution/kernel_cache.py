@@ -446,6 +446,13 @@ def compute_specs_hash(
     return cache_key
 
 
+def _cache_shared() -> bool:
+    """Return whether the kernel cache directory is shared across processes."""
+    from torch_spyre._inductor import config as _spyre_config
+
+    return _spyre_config.spyre_kernel_cache_shared
+
+
 def get_cached_kernel_dir(cache_key: str) -> Optional[str]:
     """Return the cached kernel directory if all required artifacts are present.
 
@@ -460,7 +467,9 @@ def get_cached_kernel_dir(cache_key: str) -> Optional[str]:
         logger.info("Cache MISS: No cached kernel found for key %s", cache_key)
         return None
 
-    if not os.path.isfile(os.path.join(cached_dir, _READY_SENTINEL)):
+    if _cache_shared() and not os.path.isfile(
+        os.path.join(cached_dir, _READY_SENTINEL)
+    ):
         logger.info(
             "Cache MISS: Cached dir exists but ready sentinel is missing for key %s",
             cache_key,
@@ -523,15 +532,39 @@ def commit_compile_dir(tmp_dir: str, cache_key: str) -> str:
 
     If another process already committed the same key, discards the temp dir
     and reuses the existing entry. Returns the final cache dir.
+    """
+    cache_root = get_cache_root_dir()
+    cached_dir = os.path.join(cache_root, cache_key)
+
+    if _cache_shared():
+        return _commit_compile_dir_shared(tmp_dir, cache_key, cache_root, cached_dir)
+
+    if os.path.isdir(cached_dir):
+        # Another process/thread won the race — discard our copy.
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
+        return cached_dir
+
+    try:
+        os.rename(tmp_dir, cached_dir)  # Atomic on POSIX (same filesystem)
+        logger.info("Saved compiled kernel to cache: %s", cached_dir)
+    except OSError:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
+
+    return cached_dir
+
+
+def _commit_compile_dir_shared(
+    tmp_dir: str, cache_key: str, cache_root: str, cached_dir: str
+) -> str:
+    """Commit path used when the cache directory is shared across processes.
 
     On shared/NFS storage a directory rename can become visible to other
     clients before the files inside it are readable. We serialize commits with
     an advisory flock and write a sentinel file after the rename so readers
     only treat the entry as ready once all artifacts are visible.
     """
-    cache_root = get_cache_root_dir()
-    cached_dir = os.path.join(cache_root, cache_key)
-
     if os.path.isdir(cached_dir) and os.path.isfile(
         os.path.join(cached_dir, _READY_SENTINEL)
     ):
