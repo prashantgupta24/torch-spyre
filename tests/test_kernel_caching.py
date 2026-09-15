@@ -114,6 +114,95 @@ class TestCacheArtifactCompleteness(unittest.TestCase):
                 )
 
 
+def _make_fake_entry(cache_root: str, cache_key: str, with_sentinel: bool) -> str:
+    fake_dir = os.path.join(cache_root, cache_key)
+    os.makedirs(os.path.join(fake_dir, "spyreCodeDir"), exist_ok=True)
+
+    with open(os.path.join(fake_dir, "bundle.mlir"), "w") as f:
+        f.write("fake bundle")
+    with open(os.path.join(fake_dir, "sdsc_0.json"), "w") as f:
+        f.write("{}")
+    with open(os.path.join(fake_dir, "spyreCodeDir", "spyrecode.json"), "w") as f:
+        f.write("{}")
+    with open(os.path.join(fake_dir, "spyreCodeDir", "init_binary.bin"), "wb") as f:
+        f.write(b"content")
+
+    if with_sentinel:
+        with open(os.path.join(fake_dir, "ready"), "w") as f:
+            f.write("")
+
+    return fake_dir
+
+
+class TestReadySentinel(unittest.TestCase):
+    def test_entry_without_sentinel_is_cache_miss(self):
+        """A complete entry missing the ready sentinel must be treated as a miss."""
+        with fresh_cache():
+            cache_root = get_cache_root_dir()
+            fake_key = "c" + "a" * 63
+            _make_fake_entry(cache_root, fake_key, with_sentinel=False)
+
+            result = get_cached_kernel_dir(fake_key)
+            self.assertIsNone(
+                result,
+                "Expected cache miss when ready sentinel is missing",
+            )
+
+    def test_entry_with_sentinel_is_cache_hit(self):
+        """A complete entry with the ready sentinel must be treated as a hit."""
+        with fresh_cache():
+            cache_root = get_cache_root_dir()
+            fake_key = "c" + "a" * 63
+            fake_dir = _make_fake_entry(cache_root, fake_key, with_sentinel=True)
+
+            result = get_cached_kernel_dir(fake_key)
+            self.assertEqual(result, fake_dir)
+
+    def test_commit_writes_ready_sentinel(self):
+        """commit_compile_dir must write the ready sentinel after renaming."""
+        with fresh_cache():
+            cache_root = get_cache_root_dir()
+            fake_key = "c" + "b" * 63
+            tmp_dir = allocate_compile_dir(fake_key)
+            _make_fake_entry(cache_root, fake_key, with_sentinel=False)
+
+            # The tmp dir must be outside the final cached dir path for rename.
+            os.rename(os.path.join(cache_root, fake_key), tmp_dir)
+            commit_compile_dir(tmp_dir, fake_key)
+
+            self.assertTrue(
+                os.path.isfile(os.path.join(cache_root, fake_key, "ready")),
+                "ready sentinel must exist after commit",
+            )
+
+    def test_commit_replaces_partial_entry(self):
+        """A directory without a sentinel must be replaced by commit_compile_dir."""
+        with fresh_cache():
+            cache_root = get_cache_root_dir()
+            fake_key = "c" + "c" * 63
+            valid_dir = _make_fake_entry(cache_root, fake_key, with_sentinel=False)
+
+            tmp_dir = allocate_compile_dir(fake_key)
+            # Move the valid entry out of the way and into the tmp dir.
+            os.rename(valid_dir, tmp_dir)
+
+            # Recreate a partial entry in place with no sentinel.
+            partial_dir = os.path.join(cache_root, fake_key)
+            os.makedirs(os.path.join(partial_dir, "spyreCodeDir"), exist_ok=True)
+            with open(os.path.join(partial_dir, "bundle.mlir"), "w") as f:
+                f.write("corrupted")
+
+            commit_compile_dir(tmp_dir, fake_key)
+
+            with open(os.path.join(cache_root, fake_key, "bundle.mlir")) as f:
+                content = f.read()
+            self.assertEqual(content, "fake bundle")
+            self.assertTrue(
+                os.path.isfile(os.path.join(cache_root, fake_key, "ready")),
+                "ready sentinel must exist after replacement",
+            )
+
+
 class TestPartialCacheEntryTreatedAsMiss(unittest.TestCase):
     def test_partial_write_does_not_produce_cache_hit(self):
         """A directory missing spyreCodeDir/init_binary.bin must be a cache miss."""
