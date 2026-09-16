@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import sys
+import time
 import uuid
 from collections.abc import Sequence
 from functools import lru_cache
@@ -559,7 +560,11 @@ def _commit_compile_dir_shared(
         return cached_dir
 
     _debug_print(f"ACQUIRE_LOCK key={cache_key}")
+    lock_wait_start = time.perf_counter()
     lock_fd = _acquire_cache_lock(cache_root)
+    lock_wait_ms = (time.perf_counter() - lock_wait_start) * 1000
+    _debug_print(f"LOCK_WAITED wait_ms={lock_wait_ms:.2f} key={cache_key}")
+    lock_hold_start = time.perf_counter()
     try:
         # Re-check under the lock.
         if os.path.isdir(cached_dir) and os.path.isfile(
@@ -608,7 +613,8 @@ def _commit_compile_dir_shared(
         _debug_print(f"SAVE dir={cached_dir} key={cache_key}")
         return cached_dir
     finally:
-        _debug_print(f"RELEASE_LOCK key={cache_key}")
+        lock_hold_ms = (time.perf_counter() - lock_hold_start) * 1000
+        _debug_print(f"RELEASE_LOCK hold_ms={lock_hold_ms:.2f} key={cache_key}")
         _release_cache_lock(lock_fd)
 
 
