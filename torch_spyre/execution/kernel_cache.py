@@ -420,6 +420,17 @@ def compute_specs_hash(
         _debug_pool_offsets,
     )
 
+    _debug_print(
+        f"HASH kernel={kernel_name or '<unknown>'} "
+        f"ops={','.join(_debug_ops) or '-'} "
+        f"loops={','.join(_debug_loop_counts) or '-'} "
+        f"pool={','.join(_debug_pool_offsets) or '-'} "
+        f"pool_size={pool_size} "
+        f"sdsc_count={sdsc_idx} "
+        f"content_bytes={len(content)} "
+        f"key={cache_key}"
+    )
+
     logger.info(
         "Computed specs hash  kernel=%s  ops=[%s]  loops=[%s]  pool=[%s]  key=%s",
         kernel_name or "<unknown>",
