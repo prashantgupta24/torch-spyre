@@ -16,10 +16,10 @@ import fcntl
 import json
 import os
 import shutil
+import sys
 import uuid
 from collections.abc import Sequence
 from functools import lru_cache
-from typing import Optional
 
 import torch
 from torch._inductor.codecache import code_hash
@@ -27,8 +27,13 @@ from torch._inductor.runtime.runtime_utils import cache_dir
 
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 
-
 logger = get_inductor_logger("kernel_cache")
+
+
+def _debug_print(msg: str) -> None:
+    """Temporary debug helper to surface cache events in CI logs."""
+    print(f"[SPYRE_KERNEL_CACHE] {msg}", file=sys.stderr, flush=True)
+
 
 # All artifacts that dxp_standalone must produce for a valid compiled kernel.
 # A cache entry is only considered a hit if every one of these is present.
@@ -133,7 +138,7 @@ class _KernelHashRegistry:
         if cache_key in self._registry:
             self._registry[cache_key]["miss_count"] += 1
 
-    def get(self, cache_key: str) -> Optional[dict]:
+    def get(self, cache_key: str) -> dict | None:
         return self._registry.get(cache_key)
 
     def all_entries(self) -> dict[str, dict]:
@@ -270,9 +275,9 @@ def compute_specs_hash(
                      Must be included so that kernels that differ only in
                      their pool size get different cache keys.
     """
+    from torch_spyre._inductor import config as _spyre_config
     from torch_spyre._inductor.codegen.superdsc import compile_op_spec
     from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
-    from torch_spyre._inductor import config as _spyre_config
 
     use_symbols = _spyre_config.bundle_symbolic_args
 
@@ -393,13 +398,7 @@ def compute_specs_hash(
     content_parts.append(f"pool_size:{pool_size}".encode())
 
     content = b"||".join(content_parts)
-    extra = "||".join(
-        [
-            torch.__version__,
-            _get_torch_spyre_version(),
-            _get_dxp_version(),
-        ]
-    )
+    extra = f"{torch.__version__}||{_get_torch_spyre_version()}||{_get_dxp_version()}"
 
     cache_key = code_hash(content, extra=extra)
     logger.info(
@@ -439,7 +438,7 @@ def _cache_shared() -> bool:
     return _spyre_config.spyre_kernel_cache_shared
 
 
-def get_cached_kernel_dir(cache_key: str) -> Optional[str]:
+def get_cached_kernel_dir(cache_key: str) -> str | None:
     """Return the cached kernel directory if all required artifacts are present.
 
     Checks for every entry in _REQUIRED_ARTIFACTS and at least one sdsc_N.json.
@@ -451,6 +450,7 @@ def get_cached_kernel_dir(cache_key: str) -> Optional[str]:
 
     if not os.path.isdir(cached_dir):
         logger.info("Cache MISS: No cached kernel found for key %s", cache_key)
+        _debug_print(f"MISS (no dir) key={cache_key}")
         return None
 
     if _cache_shared() and not os.path.isfile(
@@ -460,6 +460,7 @@ def get_cached_kernel_dir(cache_key: str) -> Optional[str]:
             "Cache MISS: Cached dir exists but ready sentinel is missing for key %s",
             cache_key,
         )
+        _debug_print(f"MISS (no ready sentinel) key={cache_key}")
         return None
 
     missing = [
@@ -473,6 +474,7 @@ def get_cached_kernel_dir(cache_key: str) -> Optional[str]:
             missing,
             cache_key,
         )
+        _debug_print(f"MISS (missing artifacts: {missing}) key={cache_key}")
         return None
 
     has_sdsc = any(
@@ -485,9 +487,11 @@ def get_cached_kernel_dir(cache_key: str) -> Optional[str]:
             "Cache MISS: No sdsc_N.json files found in cached dir for key %s",
             cache_key,
         )
+        _debug_print(f"MISS (no sdsc files) key={cache_key}")
         return None
 
     logger.info("Cache HIT: Found cached kernel at %s", cached_dir)
+    _debug_print(f"HIT dir={cached_dir} key={cache_key}")
     return cached_dir
 
 
@@ -513,20 +517,24 @@ def commit_compile_dir(tmp_dir: str, cache_key: str) -> str:
     cached_dir = os.path.join(cache_root, cache_key)
 
     if _cache_shared():
+        _debug_print(f"COMMIT (shared) key={cache_key}")
         return _commit_compile_dir_shared(tmp_dir, cache_key, cache_root, cached_dir)
 
     if os.path.isdir(cached_dir):
         # Another process/thread won the race — discard our copy.
         shutil.rmtree(tmp_dir, ignore_errors=True)
         logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
+        _debug_print(f"RACE (existing dir) key={cache_key}")
         return cached_dir
 
     try:
         os.rename(tmp_dir, cached_dir)  # Atomic on POSIX (same filesystem)
         logger.info("Saved compiled kernel to cache: %s", cached_dir)
+        _debug_print(f"SAVE dir={cached_dir} key={cache_key}")
     except OSError:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
+        _debug_print(f"RACE (rename failed) key={cache_key}")
 
     return cached_dir
 
@@ -547,8 +555,10 @@ def _commit_compile_dir_shared(
         # Another process/thread won the race and fully committed.
         shutil.rmtree(tmp_dir, ignore_errors=True)
         logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
+        _debug_print(f"RACE (ready exists) key={cache_key}")
         return cached_dir
 
+    _debug_print(f"ACQUIRE_LOCK key={cache_key}")
     lock_fd = _acquire_cache_lock(cache_root)
     try:
         # Re-check under the lock.
@@ -560,11 +570,13 @@ def _commit_compile_dir_shared(
                 "Cache race resolved under lock: reusing existing entry at %s",
                 cached_dir,
             )
+            _debug_print(f"RACE (ready exists under lock) key={cache_key}")
             return cached_dir
 
         if os.path.isdir(cached_dir):
             # A partially-committed entry (directory exists but no sentinel).
             # It is unsafe to use; remove it and replace with our complete copy.
+            _debug_print(f"REMOVE_PARTIAL dir={cached_dir} key={cache_key}")
             shutil.rmtree(cached_dir, ignore_errors=True)
 
         try:
@@ -578,6 +590,7 @@ def _commit_compile_dir_shared(
             ):
                 shutil.rmtree(cached_dir, ignore_errors=True)
             logger.info("Cache race resolved: reusing existing entry at %s", cached_dir)
+            _debug_print(f"RACE (rename failed under lock) key={cache_key}")
             return cached_dir
 
         # Write the ready sentinel only after the directory and all its
@@ -592,8 +605,10 @@ def _commit_compile_dir_shared(
                 pass
 
         logger.info("Saved compiled kernel to cache: %s", cached_dir)
+        _debug_print(f"SAVE dir={cached_dir} key={cache_key}")
         return cached_dir
     finally:
+        _debug_print(f"RELEASE_LOCK key={cache_key}")
         _release_cache_lock(lock_fd)
 
 
