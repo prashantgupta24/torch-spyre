@@ -123,6 +123,8 @@ def _make_fake_entry(cache_root: str, cache_key: str, with_sentinel: bool) -> st
         f.write("fake bundle")
     with open(os.path.join(fake_dir, "sdsc_0.json"), "w") as f:
         f.write("{}")
+    with open(os.path.join(fake_dir, "symbol_kinds.json"), "w") as f:
+        f.write("[]")
     with open(os.path.join(fake_dir, "spyreCodeDir", "spyrecode.json"), "w") as f:
         f.write("{}")
     with open(os.path.join(fake_dir, "spyreCodeDir", "init_binary.bin"), "wb") as f:
